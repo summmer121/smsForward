@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="xposedscope">
+        <!-- 系统进程: SmsMessage.createFromPdu 实际在这里被调用 -->
+        <item>android</item>
+        <item>com.android.phone</item>
+        <item>com.android.providers.telephony</item>
+        <!-- 短信App: 显示和存储 -->
+        <item>com.android.mms</item>
+        <item>com.android.messaging</item>
+        <item>com.google.android.apps.messaging</item>
+        <item>com.samsung.android.messaging</item>
+        <item>com.miui.smshelper</item>
+        <item>com.android.contacts</item>
+        <!-- 自身: 测试用 -->
+        <item>com.summer.mobilebalance</item>
+    </string-array>
+</resources>
