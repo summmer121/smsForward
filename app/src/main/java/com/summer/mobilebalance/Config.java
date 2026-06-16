@@ -5,8 +5,7 @@ public class Config {
 
     // Webhook
     public static final String KEY_WEBHOOK_URL = "webhook_url";
-    public static final String DEFAULT_WEBHOOK_URL =
-        "http://www.summer121.top:8123/api/webhook/01a4333e-24fb-4330-a4c6-de5af0a81de2";
+    public static final String DEFAULT_WEBHOOK_URL = "http://YOUR_SERVER:8123/api/webhook/YOUR_WEBHOOK_ID";
     public static final String KEY_WEBHOOK_METHOD = "webhook_method";
     public static final String DEFAULT_WEBHOOK_METHOD = "POST";
     public static final String KEY_WEBHOOK_BODY = "webhook_body";
