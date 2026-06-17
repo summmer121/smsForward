@@ -70,4 +70,11 @@ public class Config {
     public static final String LOG_FILE_FALLBACK = "/sdcard/MobileBalance/sms.log";
     public static final String LOG_FILE_FALLBACK2 = "/sdcard/Android/data/com.summer.mobilebalance/files/mobile_balance.log";
     public static final int MAX_LOG_FILE_BYTES = 512 * 1024;
+
+    // 最近一次成功获取的话费余额 (供主界面显示)
+    public static final String KEY_LAST_BALANCE = "last_balance";
+    public static final String KEY_LAST_BALANCE_TIME = "last_balance_time";   // 格式化时间字符串
+    public static final String KEY_LAST_BALANCE_TS = "last_balance_ts";        // long时间戳ms
+    public static final String KEY_LAST_BALANCE_SENDER = "last_balance_sender";
+    public static final String KEY_LAST_BALANCE_BODY = "last_balance_body";
 }

@@ -26,8 +26,17 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private EditText etWebhook, etMethod, etBody, etHeaders, etSenderRe, etBalanceRe;
     private CheckBox cbEnabled, cbLog;
+    private TextView tvLastBalance;  // 最近一次成功获取话费的显示卡片
 
     private static final int REQ_PERMISSIONS = 1001;
+
+    private android.os.Handler refreshHandler = new android.os.Handler();
+    private final Runnable refreshLastBalanceTask = new Runnable() {
+        @Override public void run() {
+            updateLastBalanceCard();
+            refreshHandler.postDelayed(this, 5000);  // 5秒刷新一次
+        }
+    };
 
     @SuppressWarnings("deprecation")
     @Override
@@ -54,12 +63,26 @@ public class MainActivity extends Activity {
         sv.addView(root);
 
         TextView title = new TextView(this);
-        title.setText("📱 移动话费查询 v1.4");
+        title.setText("📱 移动话费查询 v1.8");
         title.setTextSize(20);
         title.setTextColor(Color.parseColor("#00d4ff"));
         title.setGravity(Gravity.CENTER);
         title.setPadding(0, 0, 0, 20);
         root.addView(title);
+
+        // === 最近一次成功获取话费余额卡片 ===
+        tvLastBalance = new TextView(this);
+        tvLastBalance.setBackgroundColor(Color.parseColor("#1a2332"));
+        tvLastBalance.setTextColor(Color.parseColor("#00ff9f"));
+        tvLastBalance.setTextSize(13);
+        tvLastBalance.setPadding(25, 22, 25, 22);
+        tvLastBalance.setLineSpacing(0, 1.3f);
+        LinearLayout.LayoutParams lpCard = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lpCard.bottomMargin = 18;
+        tvLastBalance.setLayoutParams(lpCard);
+        root.addView(tvLastBalance);
+        updateLastBalanceCard();
 
         // 按钮行
         LinearLayout btnRow = new LinearLayout(this);
@@ -74,6 +97,15 @@ public class MainActivity extends Activity {
             }
         });
         btnRow.addView(btnLog);
+
+        Button btnHistory = makeBtn("📨 历史", "#1a2332", "#00ff9f");
+        btnHistory.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                startActivity(new Intent(MainActivity.this, SmsHistoryActivity.class));
+            }
+        });
+        addMarginLeft(btnHistory, 12);
+        btnRow.addView(btnHistory);
 
         Button btnSchedule = makeBtn("⏰ 定时发送", "#1a2332", "#00d4ff");
         btnSchedule.setOnClickListener(new View.OnClickListener() {
@@ -158,13 +190,83 @@ public class MainActivity extends Activity {
         root.addView(btnTest);
 
         TextView ver = new TextView(this);
-        ver.setText("\nv1.4  |  by 小小飞 ✈️ for 主人summer");
+        ver.setText("\nv1.8  |  by 小小飞 ✈️ for 主人summer");
         ver.setTextColor(Color.parseColor("#666666"));
         ver.setGravity(Gravity.CENTER);
         ver.setTextSize(10);
         root.addView(ver);
 
         setContentView(sv);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 进入界面立刻刷新一次,然后启动定时刷新
+        updateLastBalanceCard();
+        refreshHandler.removeCallbacks(refreshLastBalanceTask);
+        refreshHandler.postDelayed(refreshLastBalanceTask, 5000);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        refreshHandler.removeCallbacks(refreshLastBalanceTask);
+    }
+
+    /** 刷新"最近一次成功获取话费余额"卡片. 优先从 App 私有 prefs 读取(BalanceUpdateReceiver写的). */
+    private void updateLastBalanceCard() {
+        if (tvLastBalance == null) return;
+
+        String balance = null;
+        String time = null;
+        long ts = 0L;
+
+        // 优先: App 私有 prefs (BalanceUpdateReceiver 在收到广播后写入)
+        try {
+            SharedPreferences sp = getSharedPreferences(Config.PREF_NAME, Context.MODE_PRIVATE);
+            balance = sp.getString(Config.KEY_LAST_BALANCE, null);
+            time = sp.getString(Config.KEY_LAST_BALANCE_TIME, null);
+            ts = sp.getLong(Config.KEY_LAST_BALANCE_TS, 0L);
+        } catch (Throwable ignored) {}
+
+        // 兜底: 从 /data/local/tmp 跨进程文件读 (老路径)
+        if (balance == null || balance.isEmpty()) {
+            try {
+                java.io.File f = new java.io.File("/data/local/tmp/mobile_balance_last.json");
+                if (f.exists() && f.canRead()) {
+                    java.io.FileInputStream fis = new java.io.FileInputStream(f);
+                    byte[] buf = new byte[(int) f.length()];
+                    fis.read(buf);
+                    fis.close();
+                    org.json.JSONObject o = new org.json.JSONObject(new String(buf, "UTF-8"));
+                    balance = o.optString("balance", null);
+                    time = o.optString("time", null);
+                    ts = o.optLong("ts", 0L);
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        if (balance == null || balance.isEmpty() || time == null || ts == 0) {
+            tvLastBalance.setTextColor(Color.parseColor("#888888"));
+            tvLastBalance.setText("💰 上次获取余额: 暂无记录\n等待10086短信回复...\n(确保LSPosed勾选了短信App的作用域)");
+            return;
+        }
+
+        // 计算距今多久
+        long diffMs = System.currentTimeMillis() - ts;
+        String ago;
+        if (diffMs < 60_000L) ago = (diffMs / 1000) + "秒前";
+        else if (diffMs < 3600_000L) ago = (diffMs / 60_000L) + "分钟前";
+        else if (diffMs < 86400_000L) ago = (diffMs / 3600_000L) + "小时前";
+        else ago = (diffMs / 86400_000L) + "天前";
+
+        tvLastBalance.setTextColor(Color.parseColor("#00ff9f"));
+        tvLastBalance.setText(
+            "💰 上次成功获取余额\n" +
+            "    余额: " + balance + " 元\n" +
+            "    时间: " + time + "  (" + ago + ")"
+        );
     }
 
     @Override

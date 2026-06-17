@@ -182,12 +182,55 @@ public class SmsHooker implements IXposedHookLoadPackage {
         processSmsContent(sender, body, pkg, hookSrc);
     }
 
+    // === 短信去重缓存 ===
+    // 同一条短信会被多个 hook 点 (createFromPdu / getDisplayMessageBody / ContentProvider 等) 重复触发,
+    // 长短信还会被运营商拆成多个 PDU 分片. 用 sender+body 摘要 + 5秒窗口去重.
+    private static final java.util.Map<String, Long> RECENT_SMS = new java.util.HashMap<String, Long>();
+    private static final long SMS_DEDUP_WINDOW_MS = 5000L;
+    private static final Object SMS_DEDUP_LOCK = new Object();
+
+    private static boolean isDuplicateSms(String sender, String body) {
+        if (sender == null) sender = "";
+        if (body == null) body = "";
+        String key = sender + "|" + body;
+        long now = System.currentTimeMillis();
+        synchronized (SMS_DEDUP_LOCK) {
+            // 清理过期 entry
+            java.util.Iterator<java.util.Map.Entry<String, Long>> it = RECENT_SMS.entrySet().iterator();
+            while (it.hasNext()) {
+                java.util.Map.Entry<String, Long> e = it.next();
+                if (now - e.getValue() > SMS_DEDUP_WINDOW_MS) it.remove();
+            }
+            Long last = RECENT_SMS.get(key);
+            if (last != null && (now - last) < SMS_DEDUP_WINDOW_MS) {
+                return true; // 是重复
+            }
+            RECENT_SMS.put(key, now);
+            return false;
+        }
+    }
+
     private void processSmsContent(String sender, String body, String pkg, String source) {
         loadPrefs();
         if (!prefs.getBoolean(Config.KEY_ENABLED, Config.DEFAULT_ENABLED)) {
             log("SKIP", "模块已禁用, 忽略短信 from=" + sender);
             return;
         }
+
+        // 同一条短信会被 createFromPdu / getDisplayMessageBody / ContentProvider 等多处触发,5秒窗口内去重
+        if (isDuplicateSms(sender, body)) {
+            // 只在 XposedBridge.log 留个痕,不污染 App 日志
+            try { XposedBridge.log("[" + TAG + "][DEDUP] 跳过重复短信 from=" + sender + " src=" + source); } catch (Throwable ignored) {}
+            return;
+        }
+
+        // 明确展示监听到的短信内容(单独一条,方便日志中定位)
+        log("SMS_RAW", "════════════════════════════════════════");
+        log("SMS_RAW", "📩 监听到短信");
+        log("SMS_RAW", "  发件人: " + sender);
+        log("SMS_RAW", "  来源:   " + source + " (pkg=" + pkg + ")");
+        log("SMS_RAW", "  内容:   " + body);
+        log("SMS_RAW", "════════════════════════════════════════");
 
         String senderRegex = prefs.getString(Config.KEY_SENDER_REGEX, Config.DEFAULT_SENDER_REGEX);
         String balanceRegex = prefs.getString(Config.KEY_BALANCE_REGEX, Config.DEFAULT_BALANCE_REGEX);
@@ -196,6 +239,10 @@ public class SmsHooker implements IXposedHookLoadPackage {
         try {
             if (!Pattern.compile(senderRegex).matcher(sender).find()) {
                 log("SKIP", "发件人不匹配 sender_regex=[" + senderRegex + "], from=[" + sender + "], 忽略");
+                // 即使发件人不匹配也存历史(让用户看到都监听到了什么)
+                SmsHistoryStore.addRecord(sender, body, false, "", source);
+                broadcastHistory(sender, body, false, "", source);
+                log("SUMMARY", "📊 收到短信 [from=" + sender + "] -> 发件人不匹配, 未识别余额");
                 return;
             }
         } catch (Throwable t) {
@@ -218,11 +265,33 @@ public class SmsHooker implements IXposedHookLoadPackage {
                 log("SKIP", "余额正则未命中, 不发送webhook. body=[" + body + "]");
                 // 仍然弹窗告知收到了短信
                 showAlertNotification("收到短信(未匹配余额)", "来自: " + sender + "\n内容: " + body);
+                // 记录到历史
+                SmsHistoryStore.addRecord(sender, body, false, "", source);
+                broadcastHistory(sender, body, false, "", source);
+                log("SUMMARY", "📊 收到短信 [from=" + sender + "] -> 余额正则未命中, 未识别余额");
                 return;
             }
         } catch (Throwable t) {
             log("ERROR", "balance_regex 编译错误: " + t.getMessage());
             return;
+        }
+
+        // === 识别成功: 持久化最新余额和时间到 prefs (主界面会读取) ===
+        try {
+            long ts = System.currentTimeMillis();
+            String tsStr = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
+                    java.util.Locale.CHINA).format(new java.util.Date(ts));
+            // XSharedPreferences 是只读的, 用直接写文件的方式保存
+            saveLastBalance(balance, tsStr, ts, sender, body);
+            // 通过广播让 App 进程落盘 (绕过SELinux)
+            broadcastBalance(balance, tsStr, ts, sender, body);
+            // 同时存历史短信
+            SmsHistoryStore.addRecord(sender, body, true, balance, source);
+            broadcastHistory(sender, body, true, balance, source);
+            log("SAVE", "✓ 已保存最新余额到主界面显示: " + balance + " 元 @ " + tsStr);
+            log("SUMMARY", "📊 收到短信 [from=" + sender + "] -> ✅ 识别余额: " + balance + " 元");
+        } catch (Throwable t) {
+            log("ERROR", "保存最新余额失败: " + t.getMessage());
         }
 
         // 识别成功 -> 弹窗通知 + 发送webhook
@@ -231,6 +300,74 @@ public class SmsHooker implements IXposedHookLoadPackage {
 
         sendWebhook(sender, body, balance);
     }
+
+    /** 
+     * Xposed进程里保存最新余额信息，让主界面能读取.
+     * 重要: Xposed hook 跑在被hook的App进程里 (如 com.android.phone), 
+     *       没有权限写 /data/data/com.summer.mobilebalance/, 
+     *       所以改用 /data/local/tmp 这个所有进程都可写的位置.
+     */
+    private void saveLastBalance(String balance, String tsStr, long ts, String sender, String body) {
+        try {
+            // 使用 /data/local/tmp 作为跨进程通信文件 (所有应用进程都可读写)
+            String filePath = "/data/local/tmp/mobile_balance_last.json";
+            org.json.JSONObject o = new org.json.JSONObject();
+            o.put("balance", balance);
+            o.put("time", tsStr);
+            o.put("ts", ts);
+            o.put("sender", sender);
+            o.put("body", body);
+
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(filePath, false);
+            fos.write(o.toString().getBytes("UTF-8"));
+            fos.flush();
+            fos.close();
+            try { Runtime.getRuntime().exec(new String[]{"chmod", "666", filePath}); } catch (Throwable ignored) {}
+            log("SAVE", "  ✓ 写入跨进程文件: " + filePath);
+        } catch (Throwable t) {
+            log("ERROR", "saveLastBalance 写入失败: " + t.getMessage());
+            // 兜底: 尝试老路径(prefs)
+            try {
+                String prefPath = "/data/data/com.summer.mobilebalance/shared_prefs/" + Config.PREF_NAME + ".xml";
+                java.io.File pf = new java.io.File(prefPath);
+                if (!pf.exists() || !pf.canWrite()) return;
+                java.io.FileInputStream fis = new java.io.FileInputStream(pf);
+                byte[] buf = new byte[(int) pf.length()];
+                fis.read(buf);
+                fis.close();
+                String xml = new String(buf, "UTF-8");
+                xml = upsertStringPref(xml, Config.KEY_LAST_BALANCE, balance);
+                xml = upsertStringPref(xml, Config.KEY_LAST_BALANCE_TIME, tsStr);
+                xml = upsertLongPref(xml, Config.KEY_LAST_BALANCE_TS, ts);
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(pf);
+                fos.write(xml.getBytes("UTF-8"));
+                fos.flush();
+                fos.close();
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private static String upsertStringPref(String xml, String key, String value) {
+        String escaped = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;").replace("'", "&apos;");
+        String pattern = "<string name=\"" + key + "\">[^<]*</string>";
+        String replacement = "<string name=\"" + key + "\">" + escaped + "</string>";
+        if (xml.matches("(?s).*" + java.util.regex.Pattern.quote("<string name=\"" + key + "\">") + ".*")) {
+            return xml.replaceAll(pattern, java.util.regex.Matcher.quoteReplacement(replacement));
+        }
+        // 不存在则插入到 </map> 前
+        return xml.replace("</map>", "    " + replacement + "\n</map>");
+    }
+
+    private static String upsertLongPref(String xml, String key, long value) {
+        String pattern = "<long name=\"" + key + "\" value=\"[^\"]*\" />";
+        String replacement = "<long name=\"" + key + "\" value=\"" + value + "\" />";
+        if (xml.contains("<long name=\"" + key + "\"")) {
+            return xml.replaceAll(pattern, java.util.regex.Matcher.quoteReplacement(replacement));
+        }
+        return xml.replace("</map>", "    " + replacement + "\n</map>");
+    }
+
 
     private void showAlertNotification(String title, String msg) {
         if (systemContext == null) {
@@ -356,12 +493,21 @@ public class SmsHooker implements IXposedHookLoadPackage {
 
                     int code = conn.getResponseCode();
                     String resp = readStream(code >= 200 && code < 400 ? conn.getInputStream() : conn.getErrorStream());
-                    log("RESP", "← HTTP " + code + " " + resp);
+                    String tsStr = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
+                            java.util.Locale.CHINA).format(new java.util.Date());
 
-                    // 发送结果弹窗
                     if (code >= 200 && code < 300) {
-                        showAlertNotification("Webhook发送成功 ✅", "HTTP " + code + "\n余额: " + balance + "元");
+                        log("SEND_OK", "✅ Webhook发送成功 @ " + tsStr);
+                        log("SEND_OK", "  HTTP状态: " + code);
+                        log("SEND_OK", "  目标URL: " + finalUrl);
+                        log("SEND_OK", "  发送内容: " + (("GET".equals(method)) ? "(GET参数已编码到URL)" : payload));
+                        log("SEND_OK", "  服务端响应: " + resp);
+                        log("SEND_OK", "  余额: " + balance + " 元");
+                        showAlertNotification("Webhook发送成功 ✅", "HTTP " + code + "\n余额: " + balance + "元\n时间: " + tsStr);
                     } else {
+                        log("SEND_FAIL", "❌ Webhook发送失败 @ " + tsStr);
+                        log("SEND_FAIL", "  HTTP状态: " + code);
+                        log("SEND_FAIL", "  服务端响应: " + resp);
                         showAlertNotification("Webhook发送失败 ❌", "HTTP " + code + " " + resp);
                     }
                 } catch (Throwable t) {
@@ -401,6 +547,52 @@ public class SmsHooker implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log("[" + TAG + "][" + type + "] " + msg);
         }
-        LogStore.append(type, msg);
+        // 直接写文件 (兼容老路径,可能因SELinux失败,失败也无所谓)
+        try { LogStore.append(type, msg); } catch (Throwable ignored) {}
+        // 同时通过 Broadcast 发给 App 进程落盘 (绕过 SELinux 限制)
+        try { broadcastLog(type, msg); } catch (Throwable ignored) {}
+    }
+
+    /** 给 App 自己的 Receiver 发 Intent, 由 App 进程负责真正落盘. */
+    private void broadcastLog(String type, String msg) {
+        if (systemContext == null) return;
+        Intent i = new Intent("com.summer.mobilebalance.UPDATE");
+        i.setPackage("com.summer.mobilebalance");
+        i.putExtra("type", "log");
+        i.putExtra("log_type", type);
+        i.putExtra("log_msg", msg);
+        try {
+            systemContext.sendBroadcast(i);
+        } catch (Throwable ignored) {}
+    }
+
+    private void broadcastHistory(String sender, String body, boolean matched, String balance, String source) {
+        if (systemContext == null) return;
+        Intent i = new Intent("com.summer.mobilebalance.UPDATE");
+        i.setPackage("com.summer.mobilebalance");
+        i.putExtra("type", "history");
+        i.putExtra("sender", sender == null ? "" : sender);
+        i.putExtra("body", body == null ? "" : body);
+        i.putExtra("matched", matched);
+        i.putExtra("balance", balance == null ? "" : balance);
+        i.putExtra("source", source == null ? "" : source);
+        try {
+            systemContext.sendBroadcast(i);
+        } catch (Throwable ignored) {}
+    }
+
+    private void broadcastBalance(String balance, String tsStr, long ts, String sender, String body) {
+        if (systemContext == null) return;
+        Intent i = new Intent("com.summer.mobilebalance.UPDATE");
+        i.setPackage("com.summer.mobilebalance");
+        i.putExtra("type", "balance");
+        i.putExtra("balance", balance == null ? "" : balance);
+        i.putExtra("time", tsStr == null ? "" : tsStr);
+        i.putExtra("ts", ts);
+        i.putExtra("sender", sender == null ? "" : sender);
+        i.putExtra("body", body == null ? "" : body);
+        try {
+            systemContext.sendBroadcast(i);
+        } catch (Throwable ignored) {}
     }
 }

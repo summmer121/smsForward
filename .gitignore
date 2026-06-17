@@ -1,0 +1,11 @@
+# Build intermediates (regenerated each build)
+build/
+!build/.gitkeep
+
+# IDE / 系统垃圾
+.idea/
+.vscode/
+*.iml
+.DS_Store
+*.swp
+*.log
