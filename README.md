@@ -1,6 +1,10 @@
-# 📱 homeassistant移动话费查询 (MobileBalance)
+# 📱 移动话费查询 (MobileBalance)
 
 > Xposed/LSPosed 模块 — 监听 10086 短信识别话费余额 + 定时查询 + Webhook 推送 + 历史记录
+
+<p align="center">
+  <img src="docs/screenshot-v1.8.jpg" width="320" alt="主界面截图 v1.8"/>
+</p>
 
 ## ✨ 功能特性
 
